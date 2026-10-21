@@ -1,0 +1,22 @@
+#!/bin/bash
+sudo dnf install mariadb105 -y
+sudo dnf install amazon-efs-utils -y
+sudo mkdir -p /mnt/formstar
+sudo mount -t efs -o tls fs-044ffec8dcd050922:/ /mnt/formstar/
+#根据情况进行改变
+
+cd /home/ec2-user
+export DB_HOST="database-1.cluster-ckdwgusmuke0.us-east-1.rds.amazonaws.com"
+#根据情况进行改变
+
+export DB_USER="admin"
+export DB_PASSWORD="HEHUICONG666"
+
+#根据情况进行改变
+export DB_PORT="3306"
+export DB_NAME="formstar"
+export EFS_MOUNT_PATH="/mnt/formstar"
+export AWS_REGION="us-east-1"
+
+sudo chown 1000:1000 /mnt/formstar
+./formstar-v2
