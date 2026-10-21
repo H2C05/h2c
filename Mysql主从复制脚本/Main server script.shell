@@ -1,0 +1,174 @@
+#!/bin/bash
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # 无颜色
+​
+# 检查是否以root用户运行
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误：请以root用户运行此脚本${NC}" >&2
+    exit 1
+fi
+​
+# 交互式输入配置信息
+read -p "请输入主库IP地址 (默认: 192.168.88.240): " MASTER_IP
+MASTER_IP=${MASTER_IP:-192.168.88.240}
+​
+read -p "请输入从库IP地址 (默认: 192.168.88.230): " SLAVE_IP
+SLAVE_IP=${SLAVE_IP:-192.168.88.230}
+​
+read -p "请输入网卡名称 (默认: eth0): " NIC_NAME
+NIC_NAME=${NIC_NAME:-eth0}
+​
+# 检查网卡是否存在
+if ! ip link show "$NIC_NAME" &> /dev/null; then
+    echo -e "${RED}错误：网卡 $NIC_NAME 不存在，请检查输入${NC}"
+    exit 1
+fi
+​
+# MySQL root密码（默认Abc@123456）
+read -p "请输入MySQL root用户密码 (默认: Abc@123456): " MYSQL_ROOT_PASSWORD
+MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-Abc@123456}
+​
+# 同步账号repl密码（用户自定义）
+read -p "请设置同步账号(repl)的密码: " REPL_PASSWORD
+​
+# 确认信息
+echo -e "\n${YELLOW}配置信息确认:${NC}"
+echo "主库IP: $MASTER_IP"
+echo "从库IP: $SLAVE_IP"
+echo "网卡名称: $NIC_NAME"
+echo "MySQL root密码: $MYSQL_ROOT_PASSWORD"
+read -p "是否继续? (y/n) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo -e "${RED}用户取消操作${NC}"
+    exit 1
+fi
+​
+# 1. 配置网络（适配NetworkManager）
+echo -e "\n${YELLOW}1. 配置网络（网卡：$NIC_NAME）...${NC}"
+NET_CONF="/etc/sysconfig/network-scripts/ifcfg-${NIC_NAME}"
+cat << EOF > "$NET_CONF"
+TYPE=Ethernet
+PROXY_METHOD=none
+BROWSER_ONLY=no
+BOOTPROTO=static
+DEFROUTE=yes
+IPV4_FAILURE_FATAL=no
+IPV6INIT=yes
+IPV6_AUTOCONF=yes
+IPV6_DEFROUTE=yes
+IPV6_FAILURE_FATAL=no
+IPV6_ADDR_GEN_MODE=stable-privacy
+NAME=$NIC_NAME
+DEVICE=$NIC_NAME
+ONBOOT=yes
+IPADDR=$MASTER_IP
+NETMASK=255.255.255.0
+GATEWAY=192.168.88.1
+DNS1=8.8.8.8
+DNS2=114.114.114.114
+EOF
+​
+# 应用网络配置
+nmcli connection reload &> /dev/null
+nmcli connection up "$NIC_NAME" &> /dev/null
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}网络配置完成${NC}"
+else
+    echo -e "${RED}网络激活失败，请手动执行：nmcli connection up $NIC_NAME${NC}"
+    exit 1
+fi
+​
+# 2. 关闭防火墙和SELinux
+echo -e "\n${YELLOW}2. 配置防火墙和SELinux...${NC}"
+systemctl stop firewalld &> /dev/null
+systemctl disable firewalld &> /dev/null
+setenforce 0 &> /dev/null
+sed -i 's/SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+echo -e "${GREEN}防火墙和SELinux配置完成${NC}"
+​
+# 3. 时间同步
+echo -e "\n${YELLOW}3. 配置时间同步...${NC}"
+yum install -y ntpdate &> /dev/null
+ntpdate ntp.aliyun.com &> /dev/null
+echo "0 * * * * /usr/sbin/ntpdate ntp.aliyun.com >/dev/null 2>&1" >> /etc/crontab
+systemctl restart crond &> /dev/null
+echo -e "${GREEN}时间同步配置完成${NC}"
+​
+# 4. 配置MySQL主库
+echo -e "\n${YELLOW}4. 配置MySQL主库...${NC}"
+​
+# 备份原有配置
+cp /etc/my.cnf /etc/my.cnf.bak &> /dev/null
+​
+# 写入主库配置（兼容5.7+，禁用无密码登录）
+sed -n '/\[mysqld\]/,/\[.*\]/p' /etc/my.cnf.bak > /etc/my.cnf.tmp
+cat << EOF >> /etc/my.cnf.tmp
+# 主库核心配置
+server-id = 10
+log_bin = /var/lib/mysql/mysql-bin
+binlog_format = row
+expire_logs_days = 7
+binlog-ignore-db = mysql
+binlog-ignore-db = information_schema
+binlog-ignore-db = performance_schema
+sync_binlog = 1
+character-set-server = utf8mb4
+EOF
+mv /etc/my.cnf.tmp /etc/my.cnf
+​
+# 修复权限并重启MySQL
+chown -R mysql:mysql /var/lib/mysql/
+chmod -R 755 /var/lib/mysql/
+pkill mysqld &> /dev/null
+systemctl restart mysqld &> /dev/null
+​
+if systemctl is-active --quiet mysqld; then
+    echo -e "${GREEN}MySQL主库启动成功${NC}"
+else
+    echo -e "${RED}MySQL启动失败，错误日志：${NC}"
+    cat /var/log/mysqld.log | grep -i "error" | tail -10
+    exit 1
+fi
+​
+# 5. 授权root允许从库远程访问（解决从库导出数据权限）
+echo -e "\n${YELLOW}5. 授权从库访问主库...${NC}"
+mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'$SLAVE_IP' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+" &> /dev/null
+​
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}从库root访问授权成功${NC}"
+else
+    echo -e "${RED}授权失败，请手动执行：${NC}"
+    echo "mysql -uroot -p'$MYSQL_ROOT_PASSWORD' -e \"GRANT ALL ON *.* TO 'root'@'$SLAVE_IP' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD'; FLUSH PRIVILEGES;\""
+    exit 1
+fi
+​
+# 6. 创建同步账号repl
+echo -e "\n${YELLOW}6. 创建同步账号repl...${NC}"
+mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "
+CREATE USER 'repl'@'$SLAVE_IP' IDENTIFIED WITH mysql_native_password BY '$REPL_PASSWORD';
+GRANT REPLICATION SLAVE ON *.* TO 'repl'@'$SLAVE_IP';
+FLUSH PRIVILEGES;
+" &> /dev/null
+​
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}同步账号repl创建成功${NC}"
+else
+    echo -e "${RED}repl账号创建失败，请检查密码强度（需包含大小写、数字、符号）${NC}"
+    exit 1
+fi
+​
+# 7. 获取主库状态（用于从库同步）
+echo -e "\n${YELLOW}7. 获取主库同步状态...${NC}"
+MASTER_STATUS=$(mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "FLUSH TABLES WITH READ LOCK; SHOW MASTER STATUS\G" | grep -E 'File:|Position:')
+​
+echo -e "\n${GREEN}主库配置全部完成！${NC}"
+echo -e "${YELLOW}从库配置必需的主库状态信息：${NC}"
+echo "$MASTER_STATUS"
+echo -e "\n${YELLOW}重要：从库配置完成后，务必在主库执行以下命令解锁表：${NC}"
+echo "mysql -uroot -p'$MYSQL_ROOT_PASSWORD' -e 'UNLOCK TABLES;'"
