@@ -1,0 +1,72 @@
+import json
+import os
+import boto3
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+TABLE_NAME = os.environ.get("TABLE_NAME", "formstar-submissions")
+
+
+def lambda_handler(event, context):
+    # 1. 获取并解析请求体
+    body_str = (event or {}).get("body")
+
+    if isinstance(body_str, dict):
+        body = body_str
+    elif body_str:
+        try:
+            body = json.loads(body_str)
+        except (json.JSONDecodeError, TypeError):
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"message": "Invalid JSON"})
+            }
+    else:
+        body = {}
+
+    # 2. 检查请求体格式
+    if not isinstance(body, dict):
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"message": "Request body must be a JSON object"})
+        }
+
+    # 3. 获取表单数据
+    form_id = body.get("formId")
+    submission_id = body.get("submissionId")
+    answers = body.get("answers")
+
+    if not submission_id:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"message": "submissionId is required"})
+        }
+
+    # 4. 连接 DynamoDB
+    dynamodb = boto3.resource("dynamodb", region_name=REGION)
+    table = dynamodb.Table(TABLE_NAME)
+
+    # 5. 检查提交记录是否已经存在
+    response = table.get_item(
+        Key={"submissionId": submission_id}
+    )
+
+    if "Item" in response:
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"message": "Already submitted"})
+        }
+
+    # 6. 保存提交记录
+    table.put_item(
+        Item={
+            "submissionId": submission_id,
+            "formId": form_id,
+            "answers": answers
+        }
+    )
+
+    # 7. 返回成功结果
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"message": "Success"})
+    }
